@@ -1,18 +1,50 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-const TELEGRAM_BOT_TOKEN = '8817867638:AAHXOhkRZDeb8mFLmp8My_x8eFdC5Az3F0A';
-const ADMIN_CHAT_ID = '453801455';
+// === Конфигурация ===
+// Токен и chat ID администратора теперь берутся из переменных окружения.
+// На Render: Settings → Environment → добавить TELEGRAM_BOT_TOKEN и ADMIN_CHAT_ID.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 
+if (!TELEGRAM_BOT_TOKEN || !ADMIN_CHAT_ID) {
+  console.error('❌ Не заданы TELEGRAM_BOT_TOKEN или ADMIN_CHAT_ID в переменных окружения.');
+  process.exit(1);
+}
+
+// === Персистентная статистика (JSON-файл на диске) ===
+const STATS_FILE = path.join(__dirname, 'stats.json');
+
+function loadStats() {
+  try {
+    const raw = fs.readFileSync(STATS_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    // Файла нет или он повреждён — стартуем с чистого листа
+    return {
+      total: 0,
+      profiles: { frontend: 0, backend: 0, data: 0, manager: 0, devops: 0 }
+    };
+  }
+}
+
+function saveStats() {
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+  } catch (e) {
+    console.error('⚠️ Не удалось сохранить stats.json:', e.message);
+  }
+}
+
+const stats = loadStats();
+
+// === Данные квиза (без изменений по сути) ===
 const sessions = {};
-
-const stats = {
-  total: 0,
-  profiles: { frontend: 0, backend: 0, data: 0, manager: 0, devops: 0 }
-};
 
 const mainProfiles = {
   frontend: { emoji: '🎨', title: 'Frontend-маг', description: 'Ты превращаешь код в визуальную магию.' },
@@ -253,6 +285,7 @@ const mainQuestions = [
   }
 ];
 
+// === Вспомогательные функции Telegram API ===
 async function sendMessage(chatId, text, replyMarkup = null) {
   const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
   if (replyMarkup) payload.reply_markup = JSON.stringify(replyMarkup);
@@ -263,6 +296,32 @@ async function sendMessage(chatId, text, replyMarkup = null) {
   }).then(r => r.json());
 }
 
+async function answerCallbackQuery(callbackQueryId, text = null) {
+  const payload = { callback_query_id: callbackQueryId };
+  if (text) payload.text = text;
+  return fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(r => r.json()).catch(() => null);
+}
+
+async function clearInlineKeyboard(chatId, messageId) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: JSON.stringify({ inline_keyboard: [] }) })
+    });
+  } catch (e) {
+    // Сообщение могло быть удалено или слишком старое — не критично
+  }
+}
+
+function isAdmin(chatId) {
+  return chatId.toString() === ADMIN_CHAT_ID.toString();
+}
+
 async function sendMainMenu(chatId) {
   const keyboard = {
     inline_keyboard: [
@@ -270,201 +329,196 @@ async function sendMainMenu(chatId) {
       [{ text: 'ℹ️ О боте', callback_data: 'about' }]
     ]
   };
-  if (chatId.toString() === ADMIN_CHAT_ID) {
+  if (isAdmin(chatId)) {
     keyboard.inline_keyboard.push([{ text: '📊 Статистика', callback_data: 'stats' }]);
   }
   await sendMessage(chatId, '👋 Добро пожаловать! Выбери действие:', keyboard);
 }
 
+function buildStatsText() {
+  const { total, profiles: p } = stats;
+  if (total === 0) {
+    return '📊 Статистика пока пуста.';
+  }
+  let textStats = `📊 <b>Статистика квиза</b>\nВсего прохождений: ${total}\n\n`;
+  const sorted = Object.entries(p).sort((a, b) => b[1] - a[1]);
+  for (const [key, count] of sorted) {
+    const pr = mainProfiles[key];
+    const pct = Math.round((count / total) * 100);
+    textStats += `${pr.emoji} ${pr.title}: ${count} (${pct}%)\n`;
+  }
+  textStats += `\n🏆 Самый популярный профиль: ${mainProfiles[sorted[0][0]].emoji} ${mainProfiles[sorted[0][0]].title}`;
+  return textStats;
+}
+
+function startMainQuiz(chatId) {
+  sessions[chatId] = {
+    state: 'main_quiz',
+    currentQuestion: 0,
+    scores: { frontend: 0, backend: 0, data: 0, manager: 0, devops: 0 }
+  };
+  return mainQuestions[0];
+}
+
+async function sendMainQuestion(chatId, index) {
+  const q = mainQuestions[index];
+  const keyboard = {
+    inline_keyboard: q.options.map(opt => ([{ text: opt.text, callback_data: `main_answer_${index}_${opt.profile}` }]))
+  };
+  await sendMessage(chatId, q.text, keyboard);
+}
+
 async function showFinalResult(chatId, mainProfile, subKey) {
   const main = mainProfiles[mainProfile];
   let resultText = `${main.emoji} <b>${main.title}</b>\n${main.description}`;
-  let roadmap = '';
+  let roadmap = '🚀 Изучи основы направления и сделай пет-проект.';
+
   if (subKey && subProfiles[mainProfile] && subProfiles[mainProfile].results[subKey]) {
     const sub = subProfiles[mainProfile].results[subKey];
     resultText += `\n\n🔎 Твоя специализация: <b>${sub.emoji} ${sub.title}</b>`;
     roadmap = `🚀 <b>Твой роадмап:</b>\n${sub.roadmap}`;
-  } else {
-    roadmap = '🚀 Изучи основы направления и сделай пет-проект.';
   }
+
   const shareKeyboard = {
     inline_keyboard: [
       [{ text: '📲 Поделиться результатом', switch_inline_query: `Мой IT-профиль: ${main.emoji} ${main.title}` }]
     ]
   };
   await sendMessage(chatId, resultText, shareKeyboard);
-  if (roadmap) await sendMessage(chatId, roadmap);
-  const menuKeyboard = {
-    inline_keyboard: [[{ text: '↩️ В меню', callback_data: 'menu' }]]
-  };
+  await sendMessage(chatId, roadmap);
+
+  const menuKeyboard = { inline_keyboard: [[{ text: '↩️ В меню', callback_data: 'menu' }]] };
   await sendMessage(chatId, 'Что дальше?', menuKeyboard);
+
   stats.total++;
-  stats.profiles[mainProfile]++;
+  stats.profiles[mainProfile] = (stats.profiles[mainProfile] || 0) + 1;
+  saveStats();
 }
 
+// === Webhook ===
 app.post('/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
 
-    // Текстовые команды
+    // --- Текстовые команды ---
     if (update.message) {
       const msg = update.message;
       const chatId = msg.chat.id;
-      const text = msg.text || '';
+      const text = (msg.text || '').trim();
 
       if (text === '/start' || text === '/menu') {
         await sendMainMenu(chatId);
       } else if (text === '/quiz') {
-        sessions[chatId] = {
-          state: 'main_quiz',
-          currentQuestion: 0,
-          scores: { frontend: 0, backend: 0, data: 0, manager: 0, devops: 0 }
-        };
-        const q = mainQuestions[0];
+        const firstQuestion = startMainQuiz(chatId);
         const keyboard = {
-          inline_keyboard: q.options.map(opt => ([{ text: opt.text, callback_data: `main_answer_0_${opt.profile}` }]))
+          inline_keyboard: firstQuestion.options.map(opt => ([{ text: opt.text, callback_data: `main_answer_0_${opt.profile}` }]))
         };
-        await sendMessage(chatId, q.text, keyboard);
+        await sendMessage(chatId, firstQuestion.text, keyboard);
       } else if (text === '/stats') {
-        if (chatId.toString() !== ADMIN_CHAT_ID) {
+        if (!isAdmin(chatId)) {
           await sendMessage(chatId, '⛔ Нет доступа.');
-          return;
+        } else {
+          await sendMessage(chatId, buildStatsText());
         }
-        const { total, profiles: p } = stats;
-        if (total === 0) {
-          await sendMessage(chatId, '📊 Статистика пока пуста.');
-          return;
-        }
-        let textStats = `📊 <b>Статистика квиза</b>\nВсего: ${total}\n\n`;
-        const sorted = Object.entries(p).sort((a, b) => b[1] - a[1]);
-        for (const [key, count] of sorted) {
-          const pr = mainProfiles[key];
-          textStats += `${pr.emoji} ${pr.title}: ${count} (${Math.round(count / total * 100)}%)\n`;
-        }
-        textStats += `\n🏆 Самый популярный: ${mainProfiles[sorted[0][0]].emoji} ${mainProfiles[sorted[0][0]].title}`;
-        await sendMessage(chatId, textStats);
       }
+      return res.sendStatus(200);
     }
 
-    // Кнопки (callback_query)
+    // --- Нажатия инлайн-кнопок ---
     if (update.callback_query) {
       const query = update.callback_query;
       const chatId = query.message.chat.id;
       const messageId = query.message.message_id;
       const data = query.data;
 
-      res.json({ callback_query_id: query.id });
+      // Подтверждаем Telegram, что кнопка обработана (убирает "часики" на кнопке)
+      await answerCallbackQuery(query.id);
 
       if (data === 'menu') {
+        await clearInlineKeyboard(chatId, messageId);
         await sendMainMenu(chatId);
-        try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-        }); } catch(e) {}
       }
       else if (data === 'start_quiz') {
-        sessions[chatId] = {
-          state: 'main_quiz',
-          currentQuestion: 0,
-          scores: { frontend: 0, backend: 0, data: 0, manager: 0, devops: 0 }
-        };
-        const q = mainQuestions[0];
-        const keyboard = {
-          inline_keyboard: q.options.map(opt => ([{ text: opt.text, callback_data: `main_answer_0_${opt.profile}` }]))
-        };
-        await sendMessage(chatId, q.text, keyboard);
-        try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-        }); } catch(e) {}
+        await clearInlineKeyboard(chatId, messageId);
+        const firstQuestion = startMainQuiz(chatId);
+        await sendMainQuestion(chatId, 0);
       }
       else if (data === 'about') {
         await sendMessage(chatId, 'ℹ️ Этот бот помогает определить твою IT-специализацию и даёт персональный роадмап. Разработан в рамках портфолио.');
       }
       else if (data === 'stats') {
-        if (chatId.toString() !== ADMIN_CHAT_ID) {
+        if (!isAdmin(chatId)) {
           await sendMessage(chatId, '⛔ Нет доступа.');
-          return;
+        } else {
+          await sendMessage(chatId, buildStatsText());
         }
-        const { total, profiles: p } = stats;
-        if (total === 0) {
-          await sendMessage(chatId, '📊 Статистика пуста.');
-          return;
-        }
-        let textStats = `📊 <b>Статистика квиза</b>\nВсего: ${total}\n\n`;
-        for (const [key, count] of Object.entries(p).sort((a,b) => b[1]-a[1])) {
-          const pr = mainProfiles[key];
-          textStats += `${pr.emoji} ${pr.title}: ${count} (${Math.round(count/total*100)}%)\n`;
-        }
-        await sendMessage(chatId, textStats);
       }
-      // Основной квиз
+      // --- Основной квиз ---
       else if (data.startsWith('main_answer_')) {
         const parts = data.split('_');
-        const questionIndex = parseInt(parts[2]);
+        const questionIndex = parseInt(parts[2], 10);
         const profileKey = parts[3];
         const session = sessions[chatId];
+
         if (!session || session.state !== 'main_quiz' || session.currentQuestion !== questionIndex) {
           await sendMessage(chatId, 'Сессия устарела. Начни сначала: /menu');
-          return;
+          return res.sendStatus(200);
         }
+
         session.scores[profileKey]++;
-        try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-        }); } catch(e) {}
+        await clearInlineKeyboard(chatId, messageId);
 
         const nextIndex = questionIndex + 1;
         if (nextIndex < mainQuestions.length) {
           session.currentQuestion = nextIndex;
-          const q = mainQuestions[nextIndex];
-          const keyboard = {
-            inline_keyboard: q.options.map(opt => ([{ text: opt.text, callback_data: `main_answer_${nextIndex}_${opt.profile}` }]))
-          };
-          await sendMessage(chatId, q.text, keyboard);
+          await sendMainQuestion(chatId, nextIndex);
         } else {
-          const scores = session.scores;
-          let maxScore = 0;
+          let maxScore = -1;
           let mainProfile = 'frontend';
-          for (const [key, val] of Object.entries(scores)) {
+          for (const [key, val] of Object.entries(session.scores)) {
             if (val > maxScore) { maxScore = val; mainProfile = key; }
           }
-          session.state = 'sub_quiz';
-          session.mainProfile = mainProfile;
-          session.subScores = {};
-          session.currentQuestion = 0;
           const sub = subProfiles[mainProfile];
           if (!sub) {
             await showFinalResult(chatId, mainProfile, null);
             delete sessions[chatId];
-            return;
+            return res.sendStatus(200);
           }
+
+          session.state = 'sub_quiz';
+          session.mainProfile = mainProfile;
+          session.subScores = {};
+          session.currentQuestion = 0;
+
           const subQ = sub.questions[0];
           const keyboard = {
             inline_keyboard: subQ.options.map(opt => ([{ text: opt.text, callback_data: `sub_answer_0_${opt.sub}` }]))
           };
-          await sendMessage(chatId, `🧐 Твой основной профиль: ${mainProfiles[mainProfile].emoji} ${mainProfiles[mainProfile].title}. Уточним.\n\n${subQ.text}`, keyboard);
+          await sendMessage(
+            chatId,
+            `🧐 Твой основной профиль: ${mainProfiles[mainProfile].emoji} ${mainProfiles[mainProfile].title}. Уточним.\n\n${subQ.text}`,
+            keyboard
+          );
         }
       }
-      // Уточняющий квиз
+      // --- Уточняющий квиз ---
       else if (data.startsWith('sub_answer_')) {
         const parts = data.split('_');
-        const questionIndex = parseInt(parts[2]);
+        const questionIndex = parseInt(parts[2], 10);
         const subKey = parts[3];
         const session = sessions[chatId];
+
         if (!session || session.state !== 'sub_quiz' || session.currentQuestion !== questionIndex) {
           await sendMessage(chatId, 'Сессия устарела. /menu');
-          return;
+          return res.sendStatus(200);
         }
-        if (!session.subScores) session.subScores = {};
+
         session.subScores[subKey] = (session.subScores[subKey] || 0) + 1;
-        try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-        }); } catch(e) {}
+        await clearInlineKeyboard(chatId, messageId);
 
         const sub = subProfiles[session.mainProfile];
         const nextIndex = questionIndex + 1;
+
         if (nextIndex < sub.questions.length) {
           session.currentQuestion = nextIndex;
           const subQ = sub.questions[nextIndex];
@@ -473,7 +527,7 @@ app.post('/telegram-webhook', async (req, res) => {
           };
           await sendMessage(chatId, subQ.text, keyboard);
         } else {
-          let maxSubScore = 0;
+          let maxSubScore = -1;
           let selectedSub = '';
           for (const [key, val] of Object.entries(session.subScores)) {
             if (val > maxSubScore) { maxSubScore = val; selectedSub = key; }
@@ -482,11 +536,19 @@ app.post('/telegram-webhook', async (req, res) => {
           delete sessions[chatId];
         }
       }
+
+      return res.sendStatus(200);
     }
+
+    res.sendStatus(200);
   } catch (e) {
     console.error(e);
     res.sendStatus(500);
   }
+});
+
+app.get('/', (req, res) => {
+  res.send('Quiz bot is alive ✅');
 });
 
 const PORT = process.env.PORT || 3000;
