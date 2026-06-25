@@ -5,18 +5,15 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 const TELEGRAM_BOT_TOKEN = '8817867638:AAHXOhkRZDeb8mFLmp8My_x8eFdC5Az3F0A';
-const ADMIN_CHAT_ID = '453801455'; // Твой Telegram ID
+const ADMIN_CHAT_ID = '453801455';
 
-// Сессии пользователей
 const sessions = {};
 
-// Статистика (в памяти)
 const stats = {
   total: 0,
   profiles: { frontend: 0, backend: 0, data: 0, manager: 0, devops: 0 }
 };
 
-// Основные профили
 const mainProfiles = {
   frontend: { emoji: '🎨', title: 'Frontend-маг', description: 'Ты превращаешь код в визуальную магию.' },
   backend: { emoji: '⚙️', title: 'Backend-инженер', description: 'Ты — мозг системы.' },
@@ -25,7 +22,6 @@ const mainProfiles = {
   devops: { emoji: '🛠️', title: 'DevOps/SRE-инженер', description: 'Ты — хранитель стабильности.' }
 };
 
-// Подпрофили и их уточняющие вопросы
 const subProfiles = {
   frontend: {
     questions: [
@@ -194,7 +190,6 @@ const subProfiles = {
   }
 };
 
-// Основные вопросы (6 штук)
 const mainQuestions = [
   {
     text: '1. Как ты любишь решать задачи?',
@@ -258,7 +253,6 @@ const mainQuestions = [
   }
 ];
 
-// Функция отправки сообщения
 async function sendMessage(chatId, text, replyMarkup = null) {
   const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
   if (replyMarkup) payload.reply_markup = JSON.stringify(replyMarkup);
@@ -269,7 +263,6 @@ async function sendMessage(chatId, text, replyMarkup = null) {
   }).then(r => r.json());
 }
 
-// Главное меню (с учётом роли)
 async function sendMainMenu(chatId) {
   const keyboard = {
     inline_keyboard: [
@@ -277,14 +270,12 @@ async function sendMainMenu(chatId) {
       [{ text: 'ℹ️ О боте', callback_data: 'about' }]
     ]
   };
-  // Кнопку статистики видит только админ
   if (chatId.toString() === ADMIN_CHAT_ID) {
     keyboard.inline_keyboard.push([{ text: '📊 Статистика', callback_data: 'stats' }]);
   }
   await sendMessage(chatId, '👋 Добро пожаловать! Выбери действие:', keyboard);
 }
 
-// Показать финальный результат и меню
 async function showFinalResult(chatId, mainProfile, subKey) {
   const main = mainProfiles[mainProfile];
   let resultText = `${main.emoji} <b>${main.title}</b>\n${main.description}`;
@@ -303,17 +294,14 @@ async function showFinalResult(chatId, mainProfile, subKey) {
   };
   await sendMessage(chatId, resultText, shareKeyboard);
   if (roadmap) await sendMessage(chatId, roadmap);
-  // Кнопка возврата в меню
   const menuKeyboard = {
     inline_keyboard: [[{ text: '↩️ В меню', callback_data: 'menu' }]]
   };
   await sendMessage(chatId, 'Что дальше?', menuKeyboard);
-  // Обновляем статистику
   stats.total++;
   stats.profiles[mainProfile]++;
 }
 
-// Обработка вебхука
 app.post('/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
@@ -358,20 +346,17 @@ app.post('/telegram-webhook', async (req, res) => {
       }
     }
 
-    // Обработка нажатий на кнопки
+    // Кнопки (callback_query)
     if (update.callback_query) {
       const query = update.callback_query;
       const chatId = query.message.chat.id;
       const messageId = query.message.message_id;
       const data = query.data;
 
-      // Всегда отвечаем на callback
       res.json({ callback_query_id: query.id });
 
-      // Меню
       if (data === 'menu') {
         await sendMainMenu(chatId);
-        // Удаляем сообщение с кнопкой "В меню"
         try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, message_id: messageId })
@@ -388,7 +373,6 @@ app.post('/telegram-webhook', async (req, res) => {
           inline_keyboard: q.options.map(opt => ([{ text: opt.text, callback_data: `main_answer_0_${opt.profile}` }]))
         };
         await sendMessage(chatId, q.text, keyboard);
-        // Скрываем меню
         try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, message_id: messageId })
@@ -425,7 +409,6 @@ app.post('/telegram-webhook', async (req, res) => {
           return;
         }
         session.scores[profileKey]++;
-        // Скрываем кнопки старого сообщения
         try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, message_id: messageId })
@@ -440,7 +423,6 @@ app.post('/telegram-webhook', async (req, res) => {
           };
           await sendMessage(chatId, q.text, keyboard);
         } else {
-          // Определяем основной профиль
           const scores = session.scores;
           let maxScore = 0;
           let mainProfile = 'frontend';
@@ -476,7 +458,6 @@ app.post('/telegram-webhook', async (req, res) => {
         }
         if (!session.subScores) session.subScores = {};
         session.subScores[subKey] = (session.subScores[subKey] || 0) + 1;
-        // Скрываем кнопки
         try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, message_id: messageId })
